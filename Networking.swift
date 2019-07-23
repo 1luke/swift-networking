@@ -25,10 +25,6 @@ import Foundation
 public typealias DataTaskResponse = (data: Data?, urlResponse: URLResponse?, error: Error?)
 
 /// Object containing JSON decoding properties. e.g. `JSONDecoder`.
-///
-/// JSON fetch operation will retain decoder and queues based on the parameter
-/// `shouldRetainDecoder` for a given fetch operation.
-///
 public protocol JSONDecodeDelegate {
     var jsonDecoder: JSONDecoder { get }
     var decodeQueue: DispatchQueue { get }
