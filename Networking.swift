@@ -26,7 +26,7 @@ public typealias DataTaskResponse = (data: Data?, urlResponse: URLResponse?, err
 
 /// Object containing JSON decoding properties. e.g. `JSONDecoder`.
 ///
-/// JSON fetch operation will retain this _delegate_ based on the parameter
+/// JSON fetch operation will retain decoder and queues based on the parameter
 /// `shouldRetainDecoder` for a given fetch operation.
 ///
 public protocol JSONDecodeDelegate {
@@ -38,7 +38,7 @@ public protocol JSONDecodeDelegate {
 /// Abstract error type of `URLSession` `dataTask` operation. Initializable from decode
 /// failure and bad data-task response (e.g. error status code) based on internal-logic.
 ///
-/// JSON fetch operation requires this error type to support generic decoding along with
+/// JSON fetch operation requires this error type to support generic decoding with
 /// _custom_ error types. Use `AnyFetchError` for a general common implementation.
 ///
 public protocol DataTaskError: Error {
@@ -58,8 +58,8 @@ public protocol DataTaskError: Error {
 
 public extension URLSession {
     /// Fetch JSON executing given `request`. Set `shouldRetainDecoder` to **true**
-    /// if the session should keep `JSONDecodeDelegate` in memory. Default is **false**,
-    /// i.e. response is ignored if the delegate is deallocated at network callback.
+    /// if the session should keep decoder and operation queues in memory. Default is **false**,
+    /// i.e. response is ignored if the _delegate_ is deallocated at network callback.
     ///
     func fetchJson<Response: Decodable, Error: DataTaskError>(
         with request: URLRequest,
@@ -114,6 +114,16 @@ public extension JSONDecoder {
 
 }
 
+// MARK: - HTTP Methods
+
+enum HTTPMethod: String {
+    case get = "GET"
+    case put = "PUT"
+    case post = "POST"
+    case delete = "DELETE"
+    case patch = "PATCH"
+}
+
 // MARK: - Network Error
 
 /// Unmatching coding types or network issues
@@ -124,10 +134,10 @@ public enum BadRequest: Error {
     case noURLResponse
 }
 
-/// Any data-fetch failure (bad request or error status code: != 200...299)
+/// Any data-fetch failure (bad request or error status code: ~= 200...299)
 public enum AnyFetchError: DataTaskError {
     case badRequest(BadRequest)
-    case statusCode(Int)
+    case statusCode(Int, rawResponse: DataTaskResponse)
     
     // MARK: DataTaskError
     
@@ -140,7 +150,7 @@ public enum AnyFetchError: DataTaskError {
             return .failure(.badRequest(.noURLResponse))
         }
         guard 200...299 ~= urlResponse.statusCode else {
-            return .failure(.statusCode(urlResponse.statusCode))
+            return .failure(.statusCode(urlResponse.statusCode, rawResponse: rawResponse))
         }
         guard let data = rawResponse.data else {
             return .failure(.badRequest(.noData))
@@ -151,7 +161,7 @@ public enum AnyFetchError: DataTaskError {
 
 // MARK: Helpers
 
-public extension URLRequest {
+extension URLRequest {
     init(for url: URL, method: HTTPMethod, headers: [String : String]) {
         self.init(url: url)
         httpMethod = method.rawValue
@@ -160,10 +170,6 @@ public extension URLRequest {
         }
     }
 
-}
-
-public enum HTTPMethod: String {
-    case get = "GET", post = "POST", put = "PUT"
 }
 
 public extension URL {
@@ -176,4 +182,12 @@ public extension URL {
         return url
     }
 
+}
+
+extension DataTaskError {
+    static func describe(_ rawResponse: DataTaskResponse) -> String {
+        return """
+        error: \(rawResponse.error?.localizedDescription ?? "…") -- urlResponse: \(rawResponse.urlResponse?.debugDescription ?? "…") -- data: \(rawResponse.data == nil ? "…" : String(data: rawResponse.data!, encoding: .utf8) ?? " -- data-unknown -\n \(rawResponse.data!)")
+        """
+    }
 }
