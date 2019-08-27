@@ -1,6 +1,6 @@
 //  MIT License
 //
-//  Copyright (c) 2019 Luke
+//  Copyright (c) 2019 Lukas Dagne
 //
 //  Permission is hereby granted, free of charge, to any person obtaining a copy
 //  of this software and associated documentation files (the "Software"), to deal
@@ -24,30 +24,37 @@ import Foundation
 
 public typealias DataTaskResponse = (data: Data?, urlResponse: URLResponse?, error: Error?)
 
-/// Object containing JSON decoding properties. e.g. `JSONDecoder`.
+/// Properties required for JSON decoding.
 public protocol JSONDecodeDelegate {
     var jsonDecoder: JSONDecoder { get }
     var decodeQueue: DispatchQueue { get }
     var callbackQueue: DispatchQueue { get }
 }
 
-/// Abstract error type of `URLSession` `dataTask` operation. Initializable from decode
-/// failure and bad data-task response (e.g. error status code) based on internal-logic.
+/// Abstract error type of `URLSession` `dataTask` operation. Initializable from
+/// bad request (failing to encode/decode) and bad response (e.g. error status code).
 ///
 /// JSON fetch operation requires this error type to support generic decoding with
-/// _custom_ error types. Use `AnyFetchError` for a general common implementation.
+/// _custom_ error types. Use `AnyFetchError` for non-custom error type.
 ///
 public protocol DataTaskError: Error {
-    /// Return the _error_ associated with decoding failure.
-    ///
-    /// Provides `DataTaskResponse` typically for logging.
-    init(decodeError: Error, rawResponse: DataTaskResponse)
+    /// Return the error case associated with `badRequest` common error type.
+    /// The error type `BadRequest` is consisted of common error cases
+    /// e.g. encode/decode error
+    /// - Parameter badRequest: Instance of `BadRequest` common error type
+    /// - Parameter rawResponse: Raw response (if any) typically for logging
+    init(badRequest: BadRequest, rawResponse: DataTaskResponse?)
+    
+    /// Return the error evaluated from given response.
+    /// Return `nil` if the response represents success.
+    /// - Parameter rawResponse: The raw data task response
+    init?(from rawResponse: DataTaskResponse)
 
-    /// Return result, `data` or `error` (of type `Self`), from given `DataTaskResponse`.
-    ///
-    /// Evaluate `DataTaskResponse` (e.g. check status code) to determine result.
-    /// - Parameter rawResponse: Data task response: `(Data?, URLResponse?, Error?)`
-    static func extract(rawResponse: DataTaskResponse) -> Result<Data, Self>
+    /// Return description of `rawResponse` typically for logging. (Has default impl.)
+    static func describe(_ rawResponse: DataTaskResponse?) -> String
+
+    /// Return presentable error description. 
+    var errorMessage: String { get }
 }
 
 // MARK: - URLSession
@@ -76,12 +83,32 @@ public extension URLSession {
         let callback: (Result<Response, Error>) -> Void = { result in
             callbackQueue?.async { _callback(result) }
         }
-        
+
         dataTask(with: request) {
             let response = ($0, $1, $2)
             decodeQueue?.async {
                 let decoder = retained.decoder ?? jsonDecoder
                 decoder?.decode(response, callback: callback)
+            }
+        }.resume()
+    }
+    
+    /// Make the given `request` and callback (with error if any)
+    /// Use `fetchJson` instead if response JSON is expected.
+    ///
+    func makeRequest<Error: DataTaskError>(
+        _ request: URLRequest,
+        callbackQueue: DispatchQueue,
+        callback: @escaping (Error?) -> Void) {
+
+        dataTask(with: request) {
+            let response = ($0, $1, $2)
+            callbackQueue.async {
+                let error = Error(from: response)
+                if let error = error {
+                    errorLog(.urlSession, error.errorMessage)
+                }
+                callback(error)
             }
         }.resume()
     }
@@ -95,19 +122,29 @@ public extension JSONDecoder {
         _ response: DataTaskResponse,
         callback: @escaping (Result<Response, Error>) -> Void) {
 
-        switch Error.extract(rawResponse: response) {
-        case .success(let json):
-            do {
-                let decoded = try decode(Response.self, from: json)
-                callback(.success(decoded))
-            } catch let error {
-                callback(.failure(Error(decodeError: error, rawResponse: response)))
-            }
-        case .failure(let error):
+        if let error = Error(from: response) {
+            errorLog(.urlSession, error.errorMessage)
             callback(.failure(error))
+            return
+        }
+
+        guard let json = response.data else {
+            let error = Error(badRequest: .noData, rawResponse: response)
+            errorLog(.urlSession, error.errorMessage)
+            callback(.failure(error))
+            return
+        }
+
+        do {
+            let decoded = try decode(Response.self, from: json)
+            callback(.success(decoded))
+        } catch let error {
+            let decodeError = Error(badRequest: .decode(error), rawResponse: response)
+            errorLog(.jsonDecoder, decodeError.errorMessage)
+            callback(.failure(decodeError))
         }
     }
-
+    
 }
 
 // MARK: - HTTP Methods
@@ -128,31 +165,6 @@ public enum BadRequest: Error {
     case decode(Error)
     case noData
     case noURLResponse
-}
-
-/// Any data-fetch failure (bad request or error status code: ~= 200...299)
-public enum AnyFetchError: DataTaskError {
-    case badRequest(BadRequest)
-    case statusCode(Int, rawResponse: DataTaskResponse)
-    
-    // MARK: DataTaskError
-    
-    public init(decodeError error: Error, rawResponse: DataTaskResponse) {
-        self = .badRequest(.decode(error))
-    }
-    
-    public static func extract(rawResponse: DataTaskResponse) -> Result<Data, AnyFetchError> {
-        guard let urlResponse = rawResponse.urlResponse as? HTTPURLResponse else {
-            return .failure(.badRequest(.noURLResponse))
-        }
-        guard 200...299 ~= urlResponse.statusCode else {
-            return .failure(.statusCode(urlResponse.statusCode, rawResponse: rawResponse))
-        }
-        guard let data = rawResponse.data else {
-            return .failure(.badRequest(.noData))
-        }
-        return .success(data)
-    }
 }
 
 // MARK: Helpers
@@ -180,10 +192,100 @@ public extension URL {
 
 }
 
-extension DataTaskError {
-    static func describe(_ rawResponse: DataTaskResponse) -> String {
-        return """
-        error: \(rawResponse.error?.localizedDescription ?? "…") -- urlResponse: \(rawResponse.urlResponse?.debugDescription ?? "…") -- data: \(rawResponse.data == nil ? "…" : String(data: rawResponse.data!, encoding: .utf8) ?? " -- data-unknown -\n \(rawResponse.data!)")
-        """
+public extension DataTaskError {
+    static func describe(_ rawResponse: DataTaskResponse?) -> String {
+        guard let rawResponse = rawResponse else { return "none" }
+        var description: String = ""
+        description += "\n\n-- error: \(rawResponse.error?.localizedDescription ?? "…")"
+        description += "\n\n-- data: \(rawResponse.data == nil ? "…" : rawResponse.data!.htmlString ?? " -- data-unknown -\n \(rawResponse.data!)")"
+        description += "\n\n-- urlResponse: \(rawResponse.urlResponse?.description ?? "…")"
+        return description
+    }
+}
+
+public extension Data {
+    var htmlString: String? {
+        do {
+            return try NSAttributedString(data: self, options: [
+                .documentType : NSAttributedString.DocumentType.html,
+                .characterEncoding: String.Encoding.utf8.rawValue
+            ], documentAttributes: nil).string
+        } catch _ {
+            return String(data: self, encoding: .utf8)
+        }
+    }
+
+}
+
+// MARK: Common Error Type
+
+/// Any data-fetch failure (bad request or error status code: ~= 200...299).
+/// Use custom error types with more specific cases for better error handling.
+///
+public enum AnyFetchError: DataTaskError {
+    case badRequest(BadRequest)
+    case statusCode(Int, rawResponse: DataTaskResponse)
+
+    // MARK: DataTaskError
+
+    public init(badRequest: BadRequest, rawResponse: DataTaskResponse?) {
+        self = .badRequest(badRequest)
+    }
+
+    public init?(from rawResponse: DataTaskResponse) {
+        guard let urlResponse = rawResponse.urlResponse as? HTTPURLResponse else {
+            self = .badRequest(.noURLResponse)
+            return
+        }
+        guard 200...299 ~= urlResponse.statusCode else {
+            self = .statusCode(urlResponse.statusCode, rawResponse: rawResponse)
+            return
+        }
+        return nil
+    }
+
+    public var errorMessage: String {
+        switch self {
+        case .badRequest(let error): return error.localizedDescription
+        case let .statusCode(code, rawResponse: response):
+            return response.data?.htmlString ?? "\(code) (no message)"
+        }
+    }
+
+}
+
+
+// MARK: Logging
+
+import os.log
+
+@available(iOS 10.0, *)
+public extension OSLog {
+    static let urlSession = OSLog(subsystem: "com.urlSession", category: "URLSession")
+    static let jsonDecoder = OSLog(subsystem: "com.jsonDecoder", category: "JSONDecoder")
+}
+
+public enum Log {
+    case urlSession, jsonDecoder
+
+    @available(iOS 10.0, *)
+    var osLog: OSLog {
+        switch self {
+        case .urlSession: return OSLog(subsystem: "com.urlSession", category: "URLSession")
+        case .jsonDecoder: return OSLog(subsystem: "com.jsonDecoder", category: "JSONDecoder")
+        }
+    }
+
+}
+
+@inline(__always) public func debugLog(_ log: Log, _ message: String) {
+    if #available(iOS 10.0, *) {
+        os_log("%{public}s", log: log.osLog, type: .debug, "✅ \(message)")
+    }
+}
+
+@inline(__always) public func errorLog(_ log: Log, _ message: String) {
+    if #available(iOS 10.0, *) {
+        os_log("%{public}s", log: log.osLog, type: .error, "❌ \(message)")
     }
 }
